@@ -36,6 +36,14 @@ func (c *Client) Set(key, value string, exp time.Duration) {
 	c.client.Set(c.client.Context(), key, value, exp)
 }
 
+func (c *Client) Incr(key) (string, error) {
+	res, err := c.client.Incr(c.client.Context(), key).Result()
+	if err != nil {
+		return "", err
+	}
+	return res, nil
+}
+
 // Get returns the value for the given key.
 func (c *Client) Get(key string) (string, error) {
 	res, err := c.client.Get(c.client.Context(), key).Result()
