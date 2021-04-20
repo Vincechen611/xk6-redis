@@ -21,13 +21,12 @@
 package common
 
 import (
+	"bytes"
+	"fmt"
+	"io"
+
 	"github.com/dop251/goja"
 )
-
-// RunString Runs an string in the given runtime. Use this if writing ES5 in tests isn't a problem.
-func RunString(rt *goja.Runtime, src string) (goja.Value, error) {
-	return rt.RunString(src)
-}
 
 // Throw a JS error; avoids re-wrapping GoErrors.
 func Throw(rt *goja.Runtime, err error) {
@@ -35,4 +34,34 @@ func Throw(rt *goja.Runtime, err error) {
 		panic(e)
 	}
 	panic(rt.NewGoError(err))
+}
+
+// GetReader tries to return an io.Reader value from an exported goja value.
+func GetReader(data interface{}) (io.Reader, error) {
+	switch r := data.(type) {
+	case string:
+		return bytes.NewBufferString(r), nil
+	case []byte:
+		return bytes.NewBuffer(r), nil
+	case io.Reader:
+		return r, nil
+	case goja.ArrayBuffer:
+		return bytes.NewBuffer(r.Bytes()), nil
+	default:
+		return nil, fmt.Errorf("invalid type %T, it needs to be a string, byte array or an ArrayBuffer", data)
+	}
+}
+
+// ToBytes tries to return a byte slice from compatible types.
+func ToBytes(data interface{}) ([]byte, error) {
+	switch dt := data.(type) {
+	case []byte:
+		return dt, nil
+	case string:
+		return []byte(dt), nil
+	case goja.ArrayBuffer:
+		return dt.Bytes(), nil
+	default:
+		return nil, fmt.Errorf("invalid type %T, expected string, []byte or ArrayBuffer", data)
+	}
 }
