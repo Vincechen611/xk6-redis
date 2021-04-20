@@ -36,12 +36,13 @@ func (c *Client) Set(key, value string, exp time.Duration) {
 	c.client.Set(c.client.Context(), key, value, exp)
 }
 
-func (c *Client) Incr(key) (string, error) {
-	res, err := c.client.Incr(c.client.Context(), key).Result()
+// increase the given key with the given value and expiration time.
+func (c *Client) Incr(key string) int64 {
+	result, err := c.client.Incr(c.client.Context(), key).Result()
 	if err != nil {
-		return "", err
+		panic(err)
 	}
-	return res, nil
+	return result
 }
 
 // Get returns the value for the given key.
