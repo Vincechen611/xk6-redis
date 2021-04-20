@@ -211,7 +211,7 @@ func (self *_parser) scan() (tkn token.Token, literal string, parsedLiteral unis
 				case 0: // Not a keyword
 					if parsedLiteral == "true" || parsedLiteral == "false" {
 						if hasEscape {
-							tkn = token.ILLEGAL
+							tkn = token.STRING
 							return
 						}
 						self.insertSemicolon = true
@@ -219,7 +219,7 @@ func (self *_parser) scan() (tkn token.Token, literal string, parsedLiteral unis
 						return
 					} else if parsedLiteral == "null" {
 						if hasEscape {
-							tkn = token.ILLEGAL
+							tkn = token.STRING
 							return
 						}
 						self.insertSemicolon = true
@@ -229,7 +229,7 @@ func (self *_parser) scan() (tkn token.Token, literal string, parsedLiteral unis
 
 				case token.KEYWORD:
 					if hasEscape {
-						tkn = token.ILLEGAL
+						tkn = token.STRING
 						return
 					}
 					tkn = token.KEYWORD
@@ -247,7 +247,7 @@ func (self *_parser) scan() (tkn token.Token, literal string, parsedLiteral unis
 					token.CONTINUE,
 					token.DEBUGGER:
 					if hasEscape {
-						tkn = token.ILLEGAL
+						tkn = token.STRING
 						return
 					}
 					self.insertSemicolon = true
@@ -255,7 +255,7 @@ func (self *_parser) scan() (tkn token.Token, literal string, parsedLiteral unis
 
 				default:
 					if hasEscape {
-						tkn = token.ILLEGAL
+						tkn = token.STRING
 					}
 					return
 
@@ -440,32 +440,13 @@ func (self *_parser) switch6(tkn0, tkn1 token.Token, chr2 rune, tkn2, tkn3 token
 }
 
 func (self *_parser) _peek() rune {
-	if self.offset+1 < self.length {
-		return rune(self.str[self.offset+1])
+	if self.offset < self.length {
+		return rune(self.str[self.offset])
 	}
 	return -1
 }
 
 func (self *_parser) read() {
-	if self.offset < self.length {
-		self.chrOffset = self.offset
-		chr, width := rune(self.str[self.offset]), 1
-		if chr >= utf8.RuneSelf { // !ASCII
-			chr, width = utf8.DecodeRuneInString(self.str[self.offset:])
-			if chr == utf8.RuneError && width == 1 {
-				self.error(self.chrOffset, "Invalid UTF-8 character")
-			}
-		}
-		self.offset += width
-		self.chr = chr
-	} else {
-		self.chrOffset = self.length
-		self.chr = -1 // EOF
-	}
-}
-
-// This is here since the functions are so similar
-func (self *_RegExp_parser) read() {
 	if self.offset < self.length {
 		self.chrOffset = self.offset
 		chr, width := rune(self.str[self.offset]), 1

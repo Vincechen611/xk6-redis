@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"github.com/dop251/goja/file"
 	"go/ast"
 	"hash/maphash"
 	"math"
@@ -100,11 +101,12 @@ type global struct {
 	MapPrototype         *Object
 	SetPrototype         *Object
 
-	IteratorPrototype       *Object
-	ArrayIteratorPrototype  *Object
-	MapIteratorPrototype    *Object
-	SetIteratorPrototype    *Object
-	StringIteratorPrototype *Object
+	IteratorPrototype             *Object
+	ArrayIteratorPrototype        *Object
+	MapIteratorPrototype          *Object
+	SetIteratorPrototype          *Object
+	StringIteratorPrototype       *Object
+	RegExpStringIteratorPrototype *Object
 
 	ErrorPrototype          *Object
 	TypeErrorPrototype      *Object
@@ -161,8 +163,9 @@ type Runtime struct {
 	rand            RandSource
 	now             Now
 	_collator       *collate.Collator
+	parserOptions   []parser.Option
 
-	symbolRegistry map[unistring.String]*valueSymbol
+	symbolRegistry map[unistring.String]*Symbol
 
 	typeInfoCache   map[reflect.Type]*reflectTypeInfo
 	fieldNameMapper FieldNameMapper
@@ -170,16 +173,6 @@ type Runtime struct {
 	vm    *vm
 	hash  *maphash.Hash
 	idSeq uint64
-
-	// Contains a list of ids of finalized weak keys so that the runtime could pick it up and remove from
-	// all weak collections using the weakKeys map. The runtime picks it up either when the topmost function
-	// returns (i.e. the callstack becomes empty) or every 10000 'ticks' (vm instructions).
-	// It is implemented this way to avoid circular references which at the time of writing (go 1.15) causes
-	// the whole structure to become not garbage-collectable.
-	weakRefTracker *weakRefTracker
-
-	// Contains a list of weak collections that contain the key with the id.
-	weakKeys map[uint64]*weakCollections
 }
 
 type StackFrame struct {
@@ -192,7 +185,7 @@ func (f *StackFrame) SrcName() string {
 	if f.prg == nil {
 		return "<native>"
 	}
-	return f.prg.src.name
+	return f.prg.src.Name()
 }
 
 func (f *StackFrame) FuncName() string {
@@ -205,12 +198,9 @@ func (f *StackFrame) FuncName() string {
 	return f.funcName.String()
 }
 
-func (f *StackFrame) Position() Position {
+func (f *StackFrame) Position() file.Position {
 	if f.prg == nil || f.prg.src == nil {
-		return Position{
-			0,
-			0,
-		}
+		return file.Position{}
 	}
 	return f.prg.src.Position(f.prg.sourceOffset(f.pc))
 }
@@ -221,13 +211,16 @@ func (f *StackFrame) Write(b *bytes.Buffer) {
 			b.WriteString(n.String())
 			b.WriteString(" (")
 		}
-		if n := f.prg.src.name; n != "" {
-			b.WriteString(n)
+		p := f.Position()
+		if p.Filename != "" {
+			b.WriteString(p.Filename)
 		} else {
 			b.WriteString("<eval>")
 		}
 		b.WriteByte(':')
-		b.WriteString(f.Position().String())
+		b.WriteString(strconv.Itoa(p.Line))
+		b.WriteByte(':')
+		b.WriteString(strconv.Itoa(p.Column))
 		b.WriteByte('(')
 		b.WriteString(strconv.Itoa(f.pc))
 		b.WriteByte(')')
@@ -332,7 +325,7 @@ func (r *Runtime) addToGlobal(name string, value Value) {
 func (r *Runtime) createIterProto(val *Object) objectImpl {
 	o := newBaseObjectObj(val, r.global.ObjectPrototype, classObject)
 
-	o._putSym(symIterator, valueProp(r.newNativeFunc(r.returnThis, nil, "[Symbol.iterator]", nil, 0), true, false, true))
+	o._putSym(SymIterator, valueProp(r.newNativeFunc(r.returnThis, nil, "[Symbol.iterator]", nil, 0), true, false, true))
 	return o
 }
 
@@ -452,6 +445,14 @@ func (r *Runtime) CreateObject(proto *Object) *Object {
 	return r.newBaseObject(proto, classObject).val
 }
 
+func (r *Runtime) NewArray(items ...interface{}) *Object {
+	values := make([]Value, len(items))
+	for i, item := range items {
+		values[i] = r.ToValue(item)
+	}
+	return r.newArrayValues(values)
+}
+
 func (r *Runtime) NewTypeError(args ...interface{}) *Object {
 	msg := ""
 	if len(args) > 0 {
@@ -520,11 +521,22 @@ func (r *Runtime) newNativeConstructor(call func(ConstructorCall) *Object, name 
 	}
 
 	f.f = func(c FunctionCall) Value {
-		return f.defaultConstruct(call, c.Arguments)
+		thisObj, _ := c.This.(*Object)
+		if thisObj != nil {
+			res := call(ConstructorCall{
+				This:      thisObj,
+				Arguments: c.Arguments,
+			})
+			if res == nil {
+				return _undefined
+			}
+			return res
+		}
+		return f.defaultConstruct(call, c.Arguments, nil)
 	}
 
-	f.construct = func(args []Value, proto *Object) *Object {
-		return f.defaultConstruct(call, args)
+	f.construct = func(args []Value, newTarget *Object) *Object {
+		return f.defaultConstruct(call, args, newTarget)
 	}
 
 	v.self = f
@@ -1092,32 +1104,35 @@ func MustCompile(name, src string, strict bool) *Program {
 	return prg
 }
 
-func compile(name, src string, strict, eval bool) (p *Program, err error) {
-	prg, err1 := parser.ParseFile(nil, name, src, 0)
+// Parse takes a source string and produces a parsed AST. Use this function if you want to pass options
+// to the parser, e.g.:
+//
+//  p, err := Parse("test.js", "var a = true", parser.WithDisableSourceMaps)
+//  if err != nil { /* ... */ }
+//  prg, err := CompileAST(p, true)
+//  // ...
+//
+// Otherwise use Compile which combines both steps.
+func Parse(name, src string, options ...parser.Option) (prg *js_ast.Program, err error) {
+	prg, err1 := parser.ParseFile(nil, name, src, 0, options...)
 	if err1 != nil {
-		switch err1 := err1.(type) {
-		case parser.ErrorList:
-			if len(err1) > 0 && err1[0].Message == "Invalid left-hand side in assignment" {
-				err = &CompilerReferenceError{
-					CompilerError: CompilerError{
-						Message: err1.Error(),
-					},
-				}
-				return
-			}
-		}
 		// FIXME offset
 		err = &CompilerSyntaxError{
 			CompilerError: CompilerError{
 				Message: err1.Error(),
 			},
 		}
+	}
+	return
+}
+
+func compile(name, src string, strict, eval bool, parserOptions ...parser.Option) (p *Program, err error) {
+	prg, err := Parse(name, src, parserOptions...)
+	if err != nil {
 		return
 	}
 
-	p, err = compileAST(prg, strict, eval)
-
-	return
+	return compileAST(prg, strict, eval)
 }
 
 func compileAST(prg *js_ast.Program, strict, eval bool) (p *Program, err error) {
@@ -1143,7 +1158,7 @@ func compileAST(prg *js_ast.Program, strict, eval bool) (p *Program, err error) 
 }
 
 func (r *Runtime) compile(name, src string, strict, eval bool) (p *Program, err error) {
-	p, err = compile(name, src, strict, eval)
+	p, err = compile(name, src, strict, eval, r.parserOptions...)
 	if err != nil {
 		switch x1 := err.(type) {
 		case *CompilerSyntaxError:
@@ -1166,7 +1181,7 @@ func (r *Runtime) RunString(str string) (Value, error) {
 
 // RunScript executes the given string in the global context.
 func (r *Runtime) RunScript(name, src string) (Value, error) {
-	p, err := Compile(name, src, false)
+	p, err := r.compile(name, src, false, false)
 
 	if err != nil {
 		return nil, err
@@ -1270,7 +1285,42 @@ Nil is converted to null.
 Functions
 
 func(FunctionCall) Value is treated as a native JavaScript function. This increases performance because there are no
-automatic argument and return value type conversions (which involves reflect).
+automatic argument and return value type conversions (which involves reflect). Attempting to use
+the function as a constructor will result in a TypeError.
+
+func(FunctionCall, *Runtime) Value is treated as above, except the *Runtime is also passed as a parameter.
+
+func(ConstructorCall) *Object is treated as a native constructor, allowing to use it with the new
+operator:
+
+ func MyObject(call goja.ConstructorCall) *goja.Object {
+    // call.This contains the newly created object as per http://www.ecma-international.org/ecma-262/5.1/index.html#sec-13.2.2
+    // call.Arguments contain arguments passed to the function
+
+    call.This.Set("method", method)
+
+    //...
+
+    // If return value is a non-nil *Object, it will be used instead of call.This
+    // This way it is possible to return a Go struct or a map converted
+    // into goja.Value using runtime.ToValue(), however in this case
+    // instanceof will not work as expected.
+    return nil
+ }
+
+ runtime.Set("MyObject", MyObject)
+
+Then it can be used in JS as follows:
+
+ var o = new MyObject(arg);
+ var o1 = MyObject(arg); // same thing
+ o instanceof MyObject && o1 instanceof MyObject; // true
+
+When a native constructor is called directly (without the new operator) its behavior depends on
+this value: if it's an Object, it is passed through, otherwise a new one is created exactly as
+if it was called with the new operator. In either case call.NewTarget will be nil.
+
+func(ConstructorCall, *Runtime) *Object is treated as above, except the *Runtime is also passed as a parameter.
 
 Any other Go function is wrapped so that the arguments are automatically converted into the required Go types and the
 return value is converted to a JavaScript value (using this method).  If conversion is not possible, a TypeError is
@@ -1394,9 +1444,19 @@ func (r *Runtime) ToValue(i interface{}) Value {
 	case func(FunctionCall) Value:
 		name := unistring.NewFromString(runtime.FuncForPC(reflect.ValueOf(i).Pointer()).Name())
 		return r.newNativeFunc(i, nil, name, nil, 0)
+	case func(FunctionCall, *Runtime) Value:
+		name := unistring.NewFromString(runtime.FuncForPC(reflect.ValueOf(i).Pointer()).Name())
+		return r.newNativeFunc(func(call FunctionCall) Value {
+			return i(call, r)
+		}, nil, name, nil, 0)
 	case func(ConstructorCall) *Object:
 		name := unistring.NewFromString(runtime.FuncForPC(reflect.ValueOf(i).Pointer()).Name())
 		return r.newNativeConstructor(i, name, 0)
+	case func(ConstructorCall, *Runtime) *Object:
+		name := unistring.NewFromString(runtime.FuncForPC(reflect.ValueOf(i).Pointer()).Name())
+		return r.newNativeConstructor(func(call ConstructorCall) *Object {
+			return i(call, r)
+		}, name, 0)
 	case int:
 		return intToValue(int64(i))
 	case int8:
@@ -1774,32 +1834,35 @@ func (r *Runtime) toReflectValue(v Value, dst reflect.Value, ctx *objectExportCt
 			keyTyp := typ.Key()
 			elemTyp := typ.Elem()
 			needConvertKeys := !reflect.ValueOf("").Type().AssignableTo(keyTyp)
-			for _, itemName := range o.self.ownKeys(false, nil) {
+			iter := &enumerableIter{
+				wrapped: o.self.enumerateOwnKeys(),
+			}
+			for item, next := iter.next(); next != nil; item, next = next() {
 				var kv reflect.Value
 				var err error
 				if needConvertKeys {
 					kv = reflect.New(keyTyp).Elem()
-					err = r.toReflectValue(itemName, kv, ctx)
+					err = r.toReflectValue(stringValueFromRaw(item.name), kv, ctx)
 					if err != nil {
-						return fmt.Errorf("could not convert map key %s to %v", itemName.String(), typ)
+						return fmt.Errorf("could not convert map key %s to %v", item.name.String(), typ)
 					}
 				} else {
-					kv = reflect.ValueOf(itemName.String())
+					kv = reflect.ValueOf(item.name.String())
 				}
 
-				ival := o.get(itemName, nil)
+				ival := o.self.getStr(item.name, nil)
 				if ival != nil {
 					vv := reflect.New(elemTyp).Elem()
 					err := r.toReflectValue(ival, vv, ctx)
 					if err != nil {
-						return fmt.Errorf("could not convert map value %v to %v at key %s", ival, typ, itemName.String())
+						return fmt.Errorf("could not convert map value %v to %v at key %s", ival, typ, item.name.String())
 					}
 					m.SetMapIndex(kv, vv)
 				} else {
 					m.SetMapIndex(kv, reflect.Zero(elemTyp))
 				}
-
 			}
+
 			return nil
 		}
 	case reflect.Struct:
@@ -1934,21 +1997,17 @@ func (r *Runtime) SetTimeSource(now Now) {
 	r.now = now
 }
 
+// SetParserOptions sets parser options to be used by RunString, RunScript and eval() within the code.
+func (r *Runtime) SetParserOptions(opts ...parser.Option) {
+	r.parserOptions = opts
+}
+
 // New is an equivalent of the 'new' operator allowing to call it directly from Go.
 func (r *Runtime) New(construct Value, args ...Value) (o *Object, err error) {
-	defer func() {
-		if x := recover(); x != nil {
-			switch x := x.(type) {
-			case *Exception:
-				err = x
-			case *InterruptedError:
-				err = x
-			default:
-				panic(x)
-			}
-		}
-	}()
-	return r.builtin_new(r.toObject(construct), args), nil
+	err = tryFunc(func() {
+		o = r.builtin_new(r.toObject(construct), args)
+	})
+	return
 }
 
 // Callable represents a JavaScript function that can be called from Go.
@@ -2091,7 +2150,7 @@ func (r *Runtime) toNumber(v Value) Value {
 func (r *Runtime) speciesConstructor(o, defaultConstructor *Object) func(args []Value, newTarget *Object) *Object {
 	c := o.self.getStr("constructor", nil)
 	if c != nil && c != _undefined {
-		c = r.toObject(c).self.getSym(symSpecies, nil)
+		c = r.toObject(c).self.getSym(SymSpecies, nil)
 	}
 	if c == nil || c == _undefined || c == _null {
 		c = defaultConstructor
@@ -2102,7 +2161,7 @@ func (r *Runtime) speciesConstructor(o, defaultConstructor *Object) func(args []
 func (r *Runtime) speciesConstructorObj(o, defaultConstructor *Object) *Object {
 	c := o.self.getStr("constructor", nil)
 	if c != nil && c != _undefined {
-		c = r.toObject(c).self.getSym(symSpecies, nil)
+		c = r.toObject(c).self.getSym(SymSpecies, nil)
 	}
 	if c == nil || c == _undefined || c == _null {
 		return defaultConstructor
@@ -2139,7 +2198,7 @@ func (r *Runtime) getV(v Value, p Value) Value {
 
 func (r *Runtime) getIterator(obj Value, method func(FunctionCall) Value) *Object {
 	if method == nil {
-		method = toMethod(r.getV(obj, symIterator))
+		method = toMethod(r.getV(obj, SymIterator))
 		if method == nil {
 			panic(r.NewTypeError("object is not iterable"))
 		}
@@ -2199,57 +2258,9 @@ func (r *Runtime) getHash() *maphash.Hash {
 	return r.hash
 }
 
-func (r *Runtime) addWeakKey(id uint64, coll weakCollection) {
-	keys := r.weakKeys
-	if keys == nil {
-		keys = make(map[uint64]*weakCollections)
-		r.weakKeys = keys
-	}
-	colls := keys[id]
-	if colls == nil {
-		colls = &weakCollections{
-			objId: id,
-		}
-		keys[id] = colls
-	}
-	colls.add(coll)
-}
-
-func (r *Runtime) removeWeakKey(id uint64, coll weakCollection) {
-	keys := r.weakKeys
-	if colls := keys[id]; colls != nil {
-		colls.remove(coll)
-		if len(colls.colls) == 0 {
-			delete(keys, id)
-		}
-	}
-}
-
-// this gets inlined so a CALL is avoided on a critical path
-func (r *Runtime) removeDeadKeys() {
-	if r.weakRefTracker != nil {
-		r.doRemoveDeadKeys()
-	}
-}
-
-func (r *Runtime) doRemoveDeadKeys() {
-	r.weakRefTracker.Lock()
-	list := r.weakRefTracker.list
-	r.weakRefTracker.list = nil
-	r.weakRefTracker.Unlock()
-	for _, id := range list {
-		if colls := r.weakKeys[id]; colls != nil {
-			for _, coll := range colls.colls {
-				coll.removeId(id)
-			}
-			delete(r.weakKeys, id)
-		}
-	}
-}
-
 // called when the top level function returns (i.e. control is passed outside the Runtime).
 func (r *Runtime) leave() {
-	r.removeDeadKeys()
+	// run jobs, etc...
 }
 
 func nilSafe(v Value) Value {
@@ -2277,7 +2288,7 @@ func isArray(object *Object) bool {
 
 func isRegexp(v Value) bool {
 	if o, ok := v.(*Object); ok {
-		matcher := o.self.getSym(symMatch, nil)
+		matcher := o.self.getSym(SymMatch, nil)
 		if matcher != nil && matcher != _undefined {
 			return matcher.ToBoolean()
 		}
@@ -2293,4 +2304,58 @@ func limitCallArgs(call FunctionCall, n int) FunctionCall {
 	} else {
 		return call
 	}
+}
+
+func shrinkCap(newSize, oldCap int) int {
+	if oldCap > 8 {
+		if cap := oldCap / 2; cap >= newSize {
+			return cap
+		}
+	}
+	return oldCap
+}
+
+func growCap(newSize, oldSize, oldCap int) int {
+	// Use the same algorithm as in runtime.growSlice
+	doublecap := oldCap + oldCap
+	if newSize > doublecap {
+		return newSize
+	} else {
+		if oldSize < 1024 {
+			return doublecap
+		} else {
+			cap := oldCap
+			// Check 0 < cap to detect overflow
+			// and prevent an infinite loop.
+			for 0 < cap && cap < newSize {
+				cap += cap / 4
+			}
+			// Return the requested cap when
+			// the calculation overflowed.
+			if cap <= 0 {
+				return newSize
+			}
+			return cap
+		}
+	}
+}
+
+func (r *Runtime) genId() (ret uint64) {
+	if r.hash == nil {
+		h := r.getHash()
+		r.idSeq = h.Sum64()
+	}
+	if r.idSeq == 0 {
+		r.idSeq = 1
+	}
+	ret = r.idSeq
+	r.idSeq++
+	return
+}
+
+func strPropToInt(s unistring.String) (int, bool) {
+	if res, err := strconv.Atoi(string(s)); err == nil {
+		return res, true
+	}
+	return 0, false
 }
